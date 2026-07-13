@@ -172,12 +172,19 @@ def main():
         t0 = time.time()
         print("  Loading model...")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+
+        # NVFP4 models exported by NVIDIA ModelOpt may have mismatched weight shapes
+        # (packed FP4 storage, fused layers). Use ignore_mismatched_sizes.
+        load_kwargs = dict(
             torch_dtype=torch.float16,
             device_map=args.device,
             trust_remote_code=True,
         )
+        if "NVFP4" in label.upper() or "nvfp4" in str(model_path).lower():
+            load_kwargs["ignore_mismatched_sizes"] = True
+            print("  (NVFP4 model: ignoring shape mismatches for packed weights)")
+
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
         print(f"  Loaded in {time.time()-t0:.0f}s")
 
         # ── PPL ──
