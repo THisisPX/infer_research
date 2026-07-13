@@ -213,6 +213,44 @@ MODEL_LOADERS = {
 }
 
 
+def load_local_model(model_path: str, device: str = "cuda") -> tuple:
+    """Load any model from a local path.
+
+    Args:
+        model_path: path to model directory (with config.json)
+        device: device to load on
+
+    Returns:
+        (model, tokenizer) tuple
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    print(f"  Loading local model from {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map=device,
+        trust_remote_code=True,
+    )
+    return model, tokenizer
+
+
+def load_model(model_name_or_path: str, device: str = "cuda") -> tuple:
+    """Load a model by name (from registry) or local path.
+
+    Args:
+        model_name_or_path: either a key in MODEL_LOADERS or a local directory path
+        device: device to load on
+
+    Returns:
+        (model, tokenizer) tuple
+    """
+    if model_name_or_path in MODEL_LOADERS:
+        return MODEL_LOADERS[model_name_or_path](device=device)
+    else:
+        return load_local_model(model_name_or_path, device=device)
+
+
 # ── WikiText-2 calibration ───────────────────────────────────────────
 
 def get_wikitext_calibration(

@@ -10,7 +10,8 @@ from .activations import (
 )
 from .real_weights import (
     ModelData, LayerData, extract_model_data,
-    MODEL_LOADERS, get_wikitext_calibration, get_ptb_calibration,
+    MODEL_LOADERS, load_local_model, load_model,
+    get_wikitext_calibration, get_ptb_calibration,
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "activation_llm_like", "ACTIVATION_GENERATORS",
     # Real
     "ModelData", "LayerData", "extract_model_data",
-    "MODEL_LOADERS", "get_wikitext_calibration", "get_ptb_calibration",
+    "MODEL_LOADERS", "load_local_model", "load_model",
+    "get_wikitext_calibration", "get_ptb_calibration",
 ]

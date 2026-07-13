@@ -25,7 +25,7 @@ from ..quantizers.codebooks import (
 from ..rotation import apply_hadamard_rotation
 from ..weights.real_weights import (
     ModelData, LayerData, extract_model_data,
-    MODEL_LOADERS, get_wikitext_calibration,
+    load_model, get_wikitext_calibration,
 )
 
 OUTPUT_DIR = Path("results/phase1_real")
@@ -178,8 +178,7 @@ def run_per_layer_experiment(
 
     # ── Load model ──
     t0 = time.time()
-    loader = MODEL_LOADERS[model_name]
-    model, tokenizer = loader(device=device)
+    model, tokenizer = load_model(model_name, device=device)
     print(f"  Model loaded in {time.time()-t0:.0f}s")
 
     # ── Calibration data ──
@@ -307,8 +306,7 @@ def run_per_layer_experiment(
 def main():
     parser = argparse.ArgumentParser(description="Real-model quantization experiments")
     parser.add_argument("--model", type=str, default="mistral-7b",
-                        choices=list(MODEL_LOADERS.keys()),
-                        help="Model to use")
+                        help="Model name or local path (e.g. /path/to/Qwen3-4B)")
     parser.add_argument("--exp", type=str, default="per_layer",
                         choices=["per_layer"],
                         help="Experiment to run")
