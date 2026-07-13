@@ -1,317 +1,448 @@
-"""Phase 1.3 Pilot Experiments: A (Block Size Sweep) and B (Scale Format Isolation).
+"""Phase 1.3 Pilot Experiments with Joint W-A Quantization.
+
+Rotation benefit pathway:
+  Y = X·W = (X·H)(H^T·W)
+  Rotation spreads activation outlier energy → per-token quant of X·H is better
+  Weight quantization of H^T·W is nearly unchanged (orthogonal transform)
+  → Joint output Y_q = (X·H)_q · (H^T·W)_q has lower error
 
 Usage:
-    python -m src.experiments.run_experiments --exp A    # Block size sweep
-    python -m src.experiments.run_experiments --exp B    # Scale format isolation
-    python -m src.experiments.run_experiments --exp ALL  # Both
+    python run.py --exp ALL_WA           # Joint W-A experiments
+    python run.py --exp A2               # Block size sweep (joint W-A)
+    python run.py --exp B2               # Scale format isolation (joint W-A)
 """
 
 import argparse
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import torch
 
-from ..qsnr import QSNRDecomposition, compute_qsnr_decomposition, compute_qsnr_matrix
-from ..quantizers.block_quant import block_quantize
-from ..quantizers.codebooks import get_codebook, e2m1_codebook, uniform_16_codebook, int4_codebook
+from ..qsnr import JointWAQSNR, compute_wa_qsnr
+from ..quantizers.codebooks import e2m1_codebook, uniform_16_codebook, int4_codebook
 from ..quantizers.scales import SCALE_FORMATS
-from ..rotation import apply_hadamard_rotation, pad_to_power_of_2
+from ..rotation import pad_to_power_of_2
+from ..weights.activations import ACTIVATION_GENERATORS
 from ..weights.synthetic import SYNTHETIC_GENERATORS
-
-
-# ── Output ──────────────────────────────────────────────────────────
 
 OUTPUT_DIR = Path("results/phase1")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ── Experiment A: Block Size Sweep ──────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+# Experiment A2: Block Size Sweep (Joint W-A)
+# ═════════════════════════════════════════════════════════════════════
 
-@dataclass
-class ExpAResult:
-    """Results from Experiment A."""
-    config: Dict
-    # Per block-size: (G_no_rot, G_rot, gain)
-    block_results: Dict[int, Dict[str, float]] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict:
-        return {
-            "config": self.config,
-            "block_results": self.block_results,
-        }
-
-
-def run_experiment_a(
+def run_experiment_a2(
+    act_dist: str = "outlier",
     weight_dist: str = "channel_outlier",
-    d_in: int = 4096,
+    seq_len: int = 128,
+    d_model: int = 4096,
     d_out: int = 4096,
     seed: int = 42,
-) -> ExpAResult:
-    """Experiment A: Sweep block size, isolate block size effect.
+) -> Dict:
+    """Exp A2: Sweep weight block size, keep activation quantization fixed.
+
+    Isolates: does W block size affect the OVERALL W4A4 rotation benefit?
 
     Config:
-      - Codebook: Uniform-16 (fixed)
-      - Scale format: FP16 (negligible error, fixed)
-      - Block sizes: [4, 8, 16, 32, 64, 128, 256]
-      - Rotation: Hadamard vs None
+      - Activation: per-token, Uniform-16, FP16 scale (fixed across all B)
+        → rotation benefit from outlier smoothing is CONSTANT here
+      - Weight: block_size B ∈ {4,8,16,32,64,128}, Uniform-16, FP16 scale
+      - Rotation: Hadamard on both X and W via the QuaRot identity
 
-    Key question: At B=16, is rotation benefit >3%?
+    Key question: Does smaller W block size reduce the JOINT rotation gain?
+    If joint_gain(B=16) ≈ joint_gain(B=128) → W block size doesn't matter
+    If joint_gain(B=16) < joint_gain(B=128) → W block size does matter
     """
-    block_sizes = [4, 8, 16, 32, 64, 128, 256]
-    codebook = uniform_16_codebook(rmax=7.0)
+    block_sizes = [4, 8, 16, 32, 64, 128]
+    a_codebook = uniform_16_codebook(rmax=7.0)
+    w_codebook = uniform_16_codebook(rmax=7.0)
 
     print(f"\n{'='*60}")
-    print(f"Experiment A: Block Size Sweep")
-    print(f"  Distribution: {weight_dist}, shape: ({d_in}, {d_out})")
-    print(f"  Codebook: Uniform-16, Scale: FP16")
+    print(f"Experiment A2: Block Size Sweep (Joint W-A)")
+    print(f"  Act: {act_dist} ({seq_len}×{d_model}), per-token, Uniform-16, FP16")
+    print(f"  Weight: {weight_dist} ({d_model}×{d_out}), Uniform-16, FP16")
     print(f"{'='*60}")
 
-    # Generate weights (pad to power of 2 for Hadamard compatibility)
-    gen = SYNTHETIC_GENERATORS[weight_dist]
-    w = gen(d_in, d_out, seed=seed)
-    w = pad_to_power_of_2(w, dim=1)
+    act_gen = ACTIVATION_GENERATORS[act_dist]
+    wgt_gen = SYNTHETIC_GENERATORS[weight_dist]
 
-    results = ExpAResult(config={
-        "exp": "A",
-        "weight_dist": weight_dist,
-        "d_in": d_in, "d_out": w.shape[1],
-        "codebook": "Uniform-16",
-        "scale_format": "FP16",
-    })
+    x = act_gen(seq_len, d_model, seed=seed)
+    w = wgt_gen(d_model, d_out, seed=seed)
+
+    # Pad d_model to power-of-2 for Hadamard
+    n_pad = 1
+    while n_pad < d_model:
+        n_pad <<= 1
+
+    results = {"config": {"exp": "A2", "act_dist": act_dist,
+                          "weight_dist": weight_dist,
+                          "seq_len": seq_len, "d_model": d_model,
+                          "d_model_padded": n_pad, "d_out": d_out},
+               "block_results": {}}
+
+    header = f"{'B':>4s}  {'W-gain':>8s}  {'A-gain':>8s}  {'Joint-gain':>10s}  {'Joint-raw':>10s}  {'Joint-rot':>10s}  {'Verdict'}"
+    print(f"\n  {header}")
+    print(f"  {'-'*len(header)}")
 
     for B in block_sizes:
-        # Without rotation
-        r_raw = block_quantize(w, block_size=B, codebook=codebook, scale_format="FP16")
+        r = compute_wa_qsnr(
+            x=x, w=w,
+            w_block_size=B, w_codebook=w_codebook, w_scale_format="FP16",
+            a_codebook=a_codebook, a_scale_format="FP16",
+            a_quant_mode="per_token",
+        )
 
-        # With Hadamard rotation
-        w_rot = apply_hadamard_rotation(w, dim=1)
-        r_rot = block_quantize(w_rot, block_size=B, codebook=codebook, scale_format="FP16")
+        verdict = ("BENEFICIAL" if r.joint_gain > 1.01
+                   else "HARMFUL" if r.joint_gain < 0.99 else "NEUTRAL")
 
-        qsnr_raw = r_raw.qsnr_db
-        qsnr_rot = r_rot.qsnr_db
-        gain = 10 ** ((qsnr_rot - qsnr_raw) / 10) if qsnr_raw < float('inf') else 1.0
-
-        results.block_results[B] = {
-            "qsnr_raw_dB": round(qsnr_raw, 2),
-            "qsnr_rot_dB": round(qsnr_rot, 2),
-            "gain": round(gain, 4),
-            "mse_raw": round(r_raw.mse, 6),
-            "mse_rot": round(r_rot.mse, 6),
-            "is_beneficial": gain > 1.01,
-            "is_harmful": gain < 0.99,
+        results["block_results"][B] = {
+            "w_gain": round(r.w_gain, 4),
+            "a_gain": round(r.a_gain, 4),
+            "joint_gain": round(r.joint_gain, 4),
+            "joint_qsnr_raw": round(r.joint_qsnr_raw, 2),
+            "joint_qsnr_rot": round(r.joint_qsnr_rot, 2),
+            "w_qsnr_raw": round(r.w_qsnr_raw, 2),
+            "w_qsnr_rot": round(r.w_qsnr_rot, 2),
+            "a_qsnr_raw": round(r.a_qsnr_raw, 2),
+            "a_qsnr_rot": round(r.a_qsnr_rot, 2),
         }
 
-        print(f"  B={B:3d}: G={gain:.4f}  "
-              f"(raw={qsnr_raw:.1f}dB → rot={qsnr_rot:.1f}dB)  "
-              f"{'BENEFICIAL' if gain > 1 else 'HARMFUL' if gain < 1 else 'NEUTRAL'}")
+        print(f"  {B:>4d}  {r.w_gain:>8.4f}  {r.a_gain:>8.4f}  "
+              f"{r.joint_gain:>10.4f}  {r.joint_qsnr_raw:>10.1f}  "
+              f"{r.joint_qsnr_rot:>10.1f}  {verdict}")
 
-    # Save
-    out_path = OUTPUT_DIR / f"expA_{weight_dist}_{d_in}x{d_out}_s{seed}.json"
+    out_path = OUTPUT_DIR / f"expA2_jointWA_{act_dist}_{weight_dist}_s{seed}.json"
     with open(out_path, "w") as f:
-        json.dump(results.to_dict(), f, indent=2)
+        json.dump(results, f, indent=2)
     print(f"\n  → Saved to {out_path}")
-
     return results
 
 
-# ── Experiment B: Scale Format Isolation ────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+# Experiment B2: Scale Format Isolation (Joint W-A)
+# ═════════════════════════════════════════════════════════════════════
 
-@dataclass
-class ExpBResult:
-    results: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    config: Dict = field(default_factory=dict)
-
-    def to_dict(self) -> Dict:
-        return {"config": self.config, "results": self.results}
-
-
-def run_experiment_b(
+def run_experiment_b2(
+    act_dist: str = "outlier",
     weight_dist: str = "channel_outlier",
-    d_in: int = 4096,
+    seq_len: int = 128,
+    d_model: int = 4096,
     d_out: int = 4096,
     seed: int = 42,
-) -> ExpBResult:
-    """Experiment B: Isolate scale format effect.
+) -> Dict:
+    """Exp B2: Vary WEIGHT scale format, keep everything else fixed.
+
+    Since rotation benefit for ACTIVATIONS comes from smoothing X → X·H
+    (independent of W's scale format), we expect A-gain ≈ constant.
+    But W's scale format may affect the JOINT gain differently after rotation.
 
     Config:
-      - Block size: 16 (fixed, NVFP4 block size)
-      - Codebook: Uniform-16 (fixed, removes codebook shape confound)
-      - Scale formats: [FP16, E4M3, E8M0, FP32]
-      - Rotation: Hadamard vs None
-
-    Key question: Is G(E4M3) < G(FP16)?
-    If G(E4M3) < 0.95 → scale precision is dominant mechanism.
-    If G(E4M3) ≈ 1.0 → block size is the full story.
+      - Activation: per-token, Uniform-16, FP16 scale
+      - Weight: B=16, Uniform-16, scale ∈ {FP32, FP16, E4M3, E8M0}
     """
     block_size = 16
-    codebook = uniform_16_codebook(rmax=7.0)
+    a_codebook = uniform_16_codebook(rmax=7.0)
+    w_codebook = uniform_16_codebook(rmax=7.0)
     scale_formats = ["FP32", "FP16", "E4M3", "E8M0"]
 
     print(f"\n{'='*60}")
-    print(f"Experiment B: Scale Format Isolation (B={block_size})")
-    print(f"  Distribution: {weight_dist}, shape: ({d_in}, {d_out})")
-    print(f"  Codebook: Uniform-16 (removes codebook confound)")
+    print(f"Experiment B2: Scale Format Isolation (Joint W-A, B={block_size})")
+    print(f"  Act: {act_dist} ({seq_len}×{d_model}), per-token, Uniform-16, FP16")
+    print(f"  Weight: {weight_dist} ({d_model}×{d_out}), B={block_size}, Uniform-16")
     print(f"{'='*60}")
 
-    gen = SYNTHETIC_GENERATORS[weight_dist]
-    w = gen(d_in, d_out, seed=seed)
-    w = pad_to_power_of_2(w, dim=1)
-    w_rot = apply_hadamard_rotation(w, dim=1)
+    act_gen = ACTIVATION_GENERATORS[act_dist]
+    wgt_gen = SYNTHETIC_GENERATORS[weight_dist]
 
-    results = ExpBResult(config={
-        "exp": "B",
-        "weight_dist": weight_dist,
-        "d_in": d_in, "d_out": w.shape[1],
-        "block_size": block_size,
-        "codebook": "Uniform-16",
-    })
+    x = act_gen(seq_len, d_model, seed=seed)
+    w = wgt_gen(d_model, d_out, seed=seed)
 
-    header = f"{'Scale':>8s}  {'QSNR_raw':>10s}  {'QSNR_rot':>10s}  {'Gain':>8s}  {'MSE_raw':>10s}  {'MSE_rot':>10s}  {'Verdict'}"
+    results = {"config": {"exp": "B2", "act_dist": act_dist,
+                          "weight_dist": weight_dist,
+                          "seq_len": seq_len, "d_model": d_model,
+                          "d_out": d_out, "block_size": block_size},
+               "scale_results": {}}
+
+    header = (f"{'Scale':>8s}  {'W-gain':>8s}  {'A-gain':>8s}  "
+              f"{'Joint-gain':>10s}  {'Joint-raw':>10s}  "
+              f"{'Joint-rot':>10s}  {'Verdict'}")
     print(f"\n  {header}")
     print(f"  {'-'*len(header)}")
 
     for sf in scale_formats:
-        r_raw = block_quantize(w, block_size=block_size, codebook=codebook, scale_format=sf)
-        r_rot = block_quantize(w_rot, block_size=block_size, codebook=codebook, scale_format=sf)
-
-        qsnr_raw = r_raw.qsnr_db
-        qsnr_rot = r_rot.qsnr_db
-        gain = 10 ** ((qsnr_rot - qsnr_raw) / 10) if qsnr_raw < float('inf') else 1.0
-
-        fmt_info = SCALE_FORMATS[sf]
-        scale_err = fmt_info.relative_error_bound
-
-        verdict = (
-            "BENEFICIAL" if gain > 1.01
-            else "HARMFUL" if gain < 0.99
-            else "NEUTRAL"
+        r = compute_wa_qsnr(
+            x=x, w=w,
+            w_block_size=block_size, w_codebook=w_codebook,
+            w_scale_format=sf,
+            a_codebook=a_codebook, a_scale_format="FP16",
+            a_quant_mode="per_token",
         )
 
-        results.results[sf] = {
-            "qsnr_raw_dB": round(qsnr_raw, 2),
-            "qsnr_rot_dB": round(qsnr_rot, 2),
-            "gain": round(gain, 4),
-            "mse_raw": round(r_raw.mse, 6),
-            "mse_rot": round(r_rot.mse, 6),
-            "scale_err_bound": scale_err,
-            "n_clipped_raw": r_raw.n_clipped,
-            "n_clipped_rot": r_rot.n_clipped,
+        scale_info = SCALE_FORMATS[sf]
+        verdict = ("BENEFICIAL" if r.joint_gain > 1.01
+                   else "HARMFUL" if r.joint_gain < 0.99 else "NEUTRAL")
+
+        results["scale_results"][sf] = {
+            "w_gain": round(r.w_gain, 4),
+            "a_gain": round(r.a_gain, 4),
+            "joint_gain": round(r.joint_gain, 4),
+            "joint_qsnr_raw": round(r.joint_qsnr_raw, 2),
+            "joint_qsnr_rot": round(r.joint_qsnr_rot, 2),
+            "scale_err_bound": scale_info.relative_error_bound,
         }
 
-        print(f"  {sf:>8s}  {qsnr_raw:>10.2f}  {qsnr_rot:>10.2f}  "
-              f"{gain:>8.4f}  {r_raw.mse:>10.6f}  {r_rot.mse:>10.6f}  {verdict}")
+        print(f"  {sf:>8s}  {r.w_gain:>8.4f}  {r.a_gain:>8.4f}  "
+              f"{r.joint_gain:>10.4f}  {r.joint_qsnr_raw:>10.1f}  "
+              f"{r.joint_qsnr_rot:>10.1f}  {verdict}")
 
-    # Go/no-go analysis
-    g_e4m3 = results.results["E4M3"]["gain"]
-    g_fp16 = results.results["FP16"]["gain"]
+    g_e4m3 = results["scale_results"]["E4M3"]["joint_gain"]
+    g_fp16 = results["scale_results"]["FP16"]["joint_gain"]
 
     print(f"\n  {'─'*50}")
-    print(f"  G(E4M3) = {g_e4m3:.4f}  |  G(FP16) = {g_fp16:.4f}")
-    print(f"  ΔG = {g_e4m3 - g_fp16:+.4f} (scale penalty)")
+    print(f"  Joint G(E4M3) = {g_e4m3:.4f}  |  Joint G(FP16) = {g_fp16:.4f}")
+    print(f"  ΔG = {g_e4m3 - g_fp16:+.4f} (scale penalty, joint W-A)")
 
     if g_e4m3 < 0.95:
-        print(f"\n  >>> GO: G(E4M3) < 0.95 — Scale precision IS dominant. Proceed to algorithm design.")
-        results.results["_decision"] = "GO"
+        print(f"\n  >>> GO: Scale precision IS dominant for joint W-A.")
+        results["_decision"] = "GO"
     elif g_e4m3 < 1.0:
-        print(f"\n  >>> GO CAUTIOUSLY: 0.95 ≤ G(E4M3) < 1.0 — Scale precision matters but weakly.")
-        print(f"      Run Exp C (codebook isolation) to complete the picture.")
-        results.results["_decision"] = "GO_CAUTIOUS"
+        print(f"\n  >>> GO CAUTIOUSLY: Weak scale effect.")
+        results["_decision"] = "GO_CAUTIOUS"
     else:
-        print(f"\n  >>> NO-GO: G(E4M3) ≥ 1.0 — Trivial block size explanation confirmed.")
-        results.results["_decision"] = "NO_GO"
+        print(f"\n  >>> RE-EVALUATE: Check if activation outlier scale is realistic.")
+        results["_decision"] = "REEVALUATE"
 
-    # Save
-    out_path = OUTPUT_DIR / f"expB_{weight_dist}_{d_in}x{d_out}_s{seed}.json"
+    out_path = OUTPUT_DIR / f"expB2_jointWA_{act_dist}_{weight_dist}_s{seed}.json"
     with open(out_path, "w") as f:
-        json.dump(results.to_dict(), f, indent=2)
+        json.dump(results, f, indent=2)
     print(f"\n  → Saved to {out_path}")
-
     return results
 
 
-# ── Experiment A+B Combined: Full Grid ──────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+# Experiment C2: Activation Outlier Severity Sweep
+# ═════════════════════════════════════════════════════════════════════
 
-def run_experiment_ab_grid(
-    weight_dist: str = "channel_outlier",
-    d_in: int = 4096,
+def run_experiment_c2(
+    seq_len: int = 128,
+    d_model: int = 4096,
     d_out: int = 4096,
     seed: int = 42,
 ) -> Dict:
-    """Run full A×B grid: all block sizes × all scale formats × with/without rotation.
+    """Exp C2: Sweep activation outlier severity.
 
-    This produces the complete data for the three-factor decomposition analysis.
+    Tests how the rotation benefit varies with outlier severity.
+    This validates whether our synthetic activations are generating
+    realistic rotation gains.
+
+    Config:
+      - Activation: per-token, Uniform-16, FP16
+      - Weight: B=16, Uniform-16, FP16 (no scale confound)
+      - Vary: activation outlier_scale ∈ {1, 5, 10, 20, 50, 100}
     """
-    block_sizes = [4, 8, 16, 32, 64, 128, 256]
-    scale_formats = ["FP32", "FP16", "E4M3", "E8M0"]
-    codebook = uniform_16_codebook(rmax=7.0)
+    outlier_scales = [1, 5, 10, 20, 50, 100, 200]
+    a_codebook = uniform_16_codebook(rmax=7.0)
+    w_codebook = uniform_16_codebook(rmax=7.0)
 
     print(f"\n{'='*60}")
-    print(f"Experiment AB Grid: {len(block_sizes)} B × {len(scale_formats)} SF × 2 rot")
+    print(f"Experiment C2: Outlier Severity Sweep")
+    print(f"  Act: outlier ({seq_len}×{d_model}), per-token, Uniform-16, FP16")
+    print(f"  Weight: channel_outlier ({d_model}×{d_out}), B=16, Uniform-16, FP16")
     print(f"{'='*60}")
 
-    gen = SYNTHETIC_GENERATORS[weight_dist]
-    w = gen(d_in, d_out, seed=seed)
-    w = pad_to_power_of_2(w, dim=1)
-    w_rot = apply_hadamard_rotation(w, dim=1)
+    from ..weights.activations import activation_with_outliers
+    from ..weights.synthetic import channel_outlier_weights
 
-    grid = {}
-    for B in block_sizes:
-        grid[B] = {}
-        for sf in scale_formats:
-            r_raw = block_quantize(w, block_size=B, codebook=codebook, scale_format=sf)
-            r_rot = block_quantize(w_rot, block_size=B, codebook=codebook, scale_format=sf)
+    w = channel_outlier_weights(d_model, d_out, seed=seed)
 
-            qsnr_raw = r_raw.qsnr_db
-            qsnr_rot = r_rot.qsnr_db
-            gain = 10 ** ((qsnr_rot - qsnr_raw) / 10) if qsnr_raw < float('inf') else 1.0
+    results = {"config": {"exp": "C2", "seq_len": seq_len, "d_model": d_model,
+                          "d_out": d_out},
+               "outlier_results": {}}
 
-            grid[B][sf] = {
-                "qsnr_raw": round(qsnr_raw, 2),
-                "qsnr_rot": round(qsnr_rot, 2),
-                "gain": round(gain, 4),
-            }
+    header = (f"{'Outlier':>8s}  {'A-gain':>8s}  {'Joint-gain':>10s}  "
+              f"{'A-raw':>8s}  {'A-rot':>8s}  {'5th-tile':>8s}  {'1st-tile':>8s}")
+    print(f"\n  {header}")
+    print(f"  {'-'*len(header)}")
 
-    # Save
-    out_path = OUTPUT_DIR / f"expAB_grid_{weight_dist}_{d_in}x{d_out}_s{seed}.json"
+    for os in outlier_scales:
+        x = activation_with_outliers(seq_len, d_model, outlier_scale=os, seed=seed)
+        r = compute_wa_qsnr(
+            x=x, w=w,
+            w_block_size=16, w_codebook=w_codebook, w_scale_format="FP16",
+            a_codebook=a_codebook, a_scale_format="FP16",
+            a_quant_mode="per_token",
+        )
+
+        # Show worst-token gain (rotation helps outliers the most)
+        pt_gains_raw = r.a_qsnr_per_token_raw
+        pt_gains_rot = r.a_qsnr_per_token_rot
+        pt_gains = [rot - raw for raw, rot in zip(pt_gains_raw, pt_gains_rot)]
+        pt_gains_sorted = sorted(pt_gains)
+
+        # Bottom 5th and 1st percentile (most outlier-affected tokens)
+        n = len(pt_gains_sorted)
+        p5 = pt_gains_sorted[max(0, n // 20)]
+        p1 = pt_gains_sorted[max(0, n // 100)]
+
+        results["outlier_results"][os] = {
+            "a_gain": round(r.a_gain, 4),
+            "joint_gain": round(r.joint_gain, 4),
+            "a_qsnr_raw": round(r.a_qsnr_raw, 2),
+            "a_qsnr_rot": round(r.a_qsnr_rot, 2),
+            "per_token_gain_worst_5pct": round(p5, 2),
+            "per_token_gain_worst_1pct": round(p1, 2),
+        }
+
+        print(f"  {os:>8.0f}  {r.a_gain:>8.4f}  {r.joint_gain:>10.4f}  "
+              f"{r.a_qsnr_raw:>8.1f}  {r.a_qsnr_rot:>8.1f}  "
+              f"{p5:>8.1f}  {p1:>8.1f}")
+
+    out_path = OUTPUT_DIR / f"expC2_outlier_sweep_s{seed}.json"
     with open(out_path, "w") as f:
-        json.dump({"config": {"weight_dist": weight_dist, "d_in": d_in, "d_out": d_out}, "grid": grid}, f, indent=2)
-    print(f"  → Saved to {out_path}")
+        json.dump(results, f, indent=2)
+    print(f"\n  → Saved to {out_path}")
+    return results
 
-    return grid
+
+# ═════════════════════════════════════════════════════════════════════
+# Experiment D: Full NVFP4 vs INT4 W4A4 comparison
+# ═════════════════════════════════════════════════════════════════════
+
+def run_experiment_d(
+    act_dist: str = "llm_like",
+    weight_dist: str = "channel_outlier",
+    seq_len: int = 128,
+    d_model: int = 4096,
+    d_out: int = 4096,
+    seed: int = 42,
+) -> Dict:
+    """Exp D: Compare full format configurations (NVFP4 vs INT4 vs MXFP4).
+
+    Each format uses its REAL specifications:
+      - INT4: W: B=128, uniform-15 codebook, FP16 scale
+              A: per-token, uniform-15 codebook, FP16 scale
+      - NVFP4: W: B=16, E2M1 codebook, E4M3+FP32 scales
+               A: per-token, E2M1 codebook, E4M3 scale
+      - MXFP4: W: B=32, E2M1 codebook, E8M0 scale
+               A: per-token, E2M1 codebook, E8M0 scale
+    """
+    configs = {
+        "INT4": {
+            "w_block_size": 128, "w_codebook": int4_codebook(),
+            "w_scale": "FP16", "w_global": None,
+            "a_codebook": int4_codebook(), "a_scale": "FP16",
+        },
+        "NVFP4": {
+            "w_block_size": 16, "w_codebook": e2m1_codebook(),
+            "w_scale": "E4M3", "w_global": "FP32",
+            "a_codebook": e2m1_codebook(), "a_scale": "E4M3",
+        },
+        "MXFP4": {
+            "w_block_size": 32, "w_codebook": e2m1_codebook(),
+            "w_scale": "E8M0", "w_global": None,
+            "a_codebook": e2m1_codebook(), "a_scale": "E8M0",
+        },
+    }
+
+    print(f"\n{'='*60}")
+    print(f"Experiment D: Full Format Comparison (INT4 vs NVFP4 vs MXFP4)")
+    print(f"  Act: {act_dist} ({seq_len}×{d_model})")
+    print(f"  Weight: {weight_dist} ({d_model}×{d_out})")
+    print(f"{'='*60}")
+
+    act_gen = ACTIVATION_GENERATORS[act_dist]
+    wgt_gen = SYNTHETIC_GENERATORS[weight_dist]
+
+    x = act_gen(seq_len, d_model, seed=seed)
+    w = wgt_gen(d_model, d_out, seed=seed)
+
+    results = {"config": {"exp": "D", "act_dist": act_dist,
+                          "weight_dist": weight_dist,
+                          "seq_len": seq_len, "d_model": d_model, "d_out": d_out},
+               "format_results": {}}
+
+    header = (f"{'Format':>8s}  {'W-gain':>8s}  {'A-gain':>8s}  "
+              f"{'Joint-gain':>10s}  {'NoRot(dB)':>10s}  "
+              f"{'Rot(dB)':>10s}  {'Verdict'}")
+    print(f"\n  {header}")
+    print(f"  {'-'*len(header)}")
+
+    for fmt_name, cfg in configs.items():
+        r = compute_wa_qsnr(
+            x=x, w=w,
+            w_block_size=cfg["w_block_size"], w_codebook=cfg["w_codebook"],
+            w_scale_format=cfg["w_scale"], w_global_scale=cfg["w_global"],
+            a_codebook=cfg["a_codebook"], a_scale_format=cfg["a_scale"],
+            a_quant_mode="per_token",
+        )
+
+        verdict = ("BENEFICIAL" if r.joint_gain > 1.01
+                   else "HARMFUL" if r.joint_gain < 0.99 else "NEUTRAL")
+
+        results["format_results"][fmt_name] = {
+            "w_gain": round(r.w_gain, 4),
+            "a_gain": round(r.a_gain, 4),
+            "joint_gain": round(r.joint_gain, 4),
+            "joint_no_rot": round(r.joint_qsnr_raw, 2),
+            "joint_rot": round(r.joint_qsnr_rot, 2),
+        }
+
+        print(f"  {fmt_name:>8s}  {r.w_gain:>8.4f}  {r.a_gain:>8.4f}  "
+              f"{r.joint_gain:>10.4f}  {r.joint_qsnr_raw:>10.1f}  "
+              f"{r.joint_qsnr_rot:>10.1f}  {verdict}")
+
+    out_path = OUTPUT_DIR / f"expD_formats_{act_dist}_{weight_dist}_s{seed}.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  → Saved to {out_path}")
+    return results
 
 
-# ── Main ────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+# Main
+# ═════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 1.3 Pilot Experiments")
-    parser.add_argument("--exp", type=str, default="ALL",
-                        choices=["A", "B", "ALL", "GRID"],
+    parser = argparse.ArgumentParser(description="Phase 1.3 Joint W-A Experiments")
+    parser.add_argument("--exp", type=str, default="ALL_WA",
+                        choices=["A2", "B2", "C2", "D", "ALL_WA",
+                                 "ALL_OLD"],
                         help="Which experiment(s) to run")
-    parser.add_argument("--dist", type=str, default="channel_outlier",
+    parser.add_argument("--act-dist", type=str, default="outlier",
+                        choices=list(ACTIVATION_GENERATORS.keys()),
+                        help="Activation distribution")
+    parser.add_argument("--weight-dist", type=str, default="channel_outlier",
                         choices=list(SYNTHETIC_GENERATORS.keys()),
-                        help="Synthetic weight distribution")
-    parser.add_argument("--d-in", type=int, default=4096)
+                        help="Weight distribution")
+    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=4096)
     parser.add_argument("--d-out", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--all-dists", action="store_true",
-                        help="Run on all synthetic distributions")
     args = parser.parse_args()
 
-    dists = list(SYNTHETIC_GENERATORS.keys()) if args.all_dists else [args.dist]
+    if args.exp in ("A2", "ALL_WA"):
+        run_experiment_a2(args.act_dist, args.weight_dist,
+                          args.seq_len, args.d_model, args.d_out, args.seed)
+    if args.exp in ("B2", "ALL_WA"):
+        run_experiment_b2(args.act_dist, args.weight_dist,
+                          args.seq_len, args.d_model, args.d_out, args.seed)
+    if args.exp in ("C2", "ALL_WA"):
+        run_experiment_c2(args.seq_len, args.d_model, args.d_out, args.seed)
+    if args.exp in ("D", "ALL_WA"):
+        run_experiment_d(args.act_dist, args.weight_dist,
+                         args.seq_len, args.d_model, args.d_out, args.seed)
 
-    for dist in dists:
-        if args.exp in ("A", "ALL"):
-            run_experiment_a(dist, args.d_in, args.d_out, args.seed)
-
-        if args.exp in ("B", "ALL"):
-            run_experiment_b(dist, args.d_in, args.d_out, args.seed)
-
-        if args.exp in ("GRID", "ALL"):
-            run_experiment_ab_grid(dist, args.d_in, args.d_out, args.seed)
+    # Legacy weight-only experiments
+    if args.exp in ("ALL_OLD",):
+        from .run_experiments_old import run_experiment_a, run_experiment_b
+        dists = [args.weight_dist]
+        for dist in dists:
+            run_experiment_a(dist, args.d_model, args.d_out, args.seed)
+            run_experiment_b(dist, args.d_model, args.d_out, args.seed)
 
 
 if __name__ == "__main__":

@@ -56,36 +56,41 @@ def fwht(x: torch.Tensor) -> torch.Tensor:
 def apply_hadamard_rotation(w: torch.Tensor, dim: int = 1) -> torch.Tensor:
     """Apply Hadamard rotation to weight matrix for quantization.
 
-    W' = H · W  (rotate along output dimension).
+    QuaRot identity: Y = X·W = (X·H)(H^T·W)
+    - dim=1 (input dim):  W → H^T·W, used for weight input rotation
+    - dim=1 (output dim): W → W·H, used for weight output rotation
 
-    This is the standard QuaRot-style rotation. The inverse rotation
-    H^T · W' = H^T · H · W = W is applied during inference to recover
-    original outputs.
+    Since Hadamard H = H^T, the distinction is academic for Hadamard.
+    The pad dimension matters: dim determines which dim is padded to power-of-2.
 
     Args:
         w: weight matrix (d_in, d_out)
-        dim: dimension to rotate along (0=input, 1=output)
+        dim: dimension to rotate along (0=rows/input, 1=cols/output)
 
     Returns:
-        Rotated weight matrix, same shape
+        Rotated weight matrix, same shape (trimmed from padded)
     """
     d = w.shape[dim]
     n_pad = _next_power_of_2(d)
 
     if n_pad != d:
         if dim == 1:
+            # Pad output dim (right side): (d_in, d_out) → (d_in, n_pad)
             w_padded = torch.nn.functional.pad(w, (0, n_pad - d), value=0.0)
         else:
+            # Pad input dim (bottom): (d_in, d_out) → (n_pad, d_out)
             w_padded = torch.nn.functional.pad(w, (0, 0, 0, n_pad - d), value=0.0)
     else:
         w_padded = w
 
     if dim == 1:
-        # Rotate output dimension: H @ W^T → transpose back
-        rotated = fwht(w_padded.T).T
+        # Rotate columns (output dim): W @ H_{n_pad}
+        # fwht acts on last dim → applies H directly
+        rotated = fwht(w_padded)
     else:
-        # Rotate input dimension
-        rotated = fwht(w_padded.T).T  # same operation
+        # Rotate rows (input dim): H^T_{n_pad} @ W
+        # Transpose → fwht on last dim (=n_pad) → transpose back
+        rotated = fwht(w_padded.T).T
 
     if n_pad != d:
         if dim == 1:
