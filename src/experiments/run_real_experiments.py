@@ -292,7 +292,8 @@ def run_per_layer_experiment(
         }
 
     # ── Save ──
-    out_path = OUTPUT_DIR / f"r1_per_layer_{model_name}.json"
+    safe_name = model_name.replace("/", "_").replace("\\", "_")
+    out_path = OUTPUT_DIR / f"r1_per_layer_{safe_name}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n  → Saved to {out_path}")
