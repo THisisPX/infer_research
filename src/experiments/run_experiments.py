@@ -409,8 +409,7 @@ def run_experiment_d(
 def main():
     parser = argparse.ArgumentParser(description="Phase 1.3 Joint W-A Experiments")
     parser.add_argument("--exp", type=str, default="ALL_WA",
-                        choices=["A2", "B2", "C2", "D", "ALL_WA",
-                                 "ALL_OLD"],
+                        choices=["A2", "B2", "C2", "D", "ALL_WA"],
                         help="Which experiment(s) to run")
     parser.add_argument("--act-dist", type=str, default="outlier",
                         choices=list(ACTIVATION_GENERATORS.keys()),
@@ -435,15 +434,6 @@ def main():
     if args.exp in ("D", "ALL_WA"):
         run_experiment_d(args.act_dist, args.weight_dist,
                          args.seq_len, args.d_model, args.d_out, args.seed)
-
-    # Legacy weight-only experiments
-    if args.exp in ("ALL_OLD",):
-        from .run_experiments_old import run_experiment_a, run_experiment_b
-        dists = [args.weight_dist]
-        for dist in dists:
-            run_experiment_a(dist, args.d_model, args.d_out, args.seed)
-            run_experiment_b(dist, args.d_model, args.d_out, args.seed)
-
 
 if __name__ == "__main__":
     main()
