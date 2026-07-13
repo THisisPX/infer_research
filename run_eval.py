@@ -204,34 +204,62 @@ def get_linear_layers(model) -> List[Tuple[str, nn.Linear]]:
 
 
 def apply_hadamard_to_model(model, device: str = "cuda"):
-    """Apply Hadamard rotation to all linear layer weights.
+    """Apply Hadamard rotation to all linear layers + embed/lm_head.
 
-    QuaRot identity: Y = X·W = (X·H)(H^T·W)
-    Rotate on INPUT dim: W → H^T·W (dim=0 of HF weight format = rows/d_out in our convention)
+    QuaRot scheme for HF models: W rotates on BOTH dims so rotations
+    cancel between consecutive layers.
 
-    Wait — HF stores weights as (d_out, d_in). The linear operation is:
-      y = x @ W^T   where x is (..., d_in), W is (d_out, d_in)
-    QuaRot: y = (x @ H) @ (H^T @ W)^T = x @ H @ W^T @ H = ...
-    Actually: y = x W^T. With rotation: (x @ H) (H^T @ W)^T = x @ H @ W^T @ H
-    But QuaRot rotates ACTIVATIONS along the hidden dim (last dim of x, first dim of W^T).
-    For the weight side: W_new = H^T @ W where H acts on d_in dimension.
-    In HF format (d_out, d_in): rotate along dim=1 (input dim).
+      W_new = H_dout @ W @ H_din^T
 
-    Actually simpler: since Hadamard H = H^T, we just apply rotation
-    to dim=1 of HF weight (the d_in / input dimension).
+    Between layers L, L+1 where d_out_L = d_in_{L+1}:
+      (H @ W_L @ H) @ (H^T @ W_{L+1} @ H^T)^T = H @ W_L @ W_{L+1} @ H^T
+
+    The H between layers cancels. Residual connections also stay valid
+    because each block output is embedded in the same rotated space.
     """
     layers = get_linear_layers(model)
+
     for name, module in layers:
         w = module.weight.data.float()  # (d_out, d_in)
-        # Pad d_in to power of 2
-        n = _next_power_of_2(w.shape[1])
-        if n > w.shape[1]:
-            w_pad = torch.nn.functional.pad(w, (0, n - w.shape[1]))
-        else:
-            w_pad = w
-        # Apply Hadamard along dim=1 (input dim): W_new = W @ H^T = W @ H (since H symmetric)
-        w_rot = apply_hadamard_rotation(w_pad, dim=1)[:, :w.shape[1]]
-        module.weight.data = w_rot.to(module.weight.dtype).to(module.weight.device)
+        d_out, d_in = w.shape
+
+        # Rotate dim=0 (output): H_dout @ W
+        n_out = _next_power_of_2(d_out)
+        if n_out > d_out:
+            w = torch.nn.functional.pad(w, (0, 0, 0, n_out - d_out))
+        w = apply_hadamard_rotation(w, dim=0)[:d_out]
+
+        # Rotate dim=1 (input): W @ H_din
+        n_in = _next_power_of_2(d_in)
+        if n_in > d_in:
+            w = torch.nn.functional.pad(w, (0, n_in - d_in))
+        w = apply_hadamard_rotation(w, dim=1)[:, :d_in]
+
+        module.weight.data = w.to(module.weight.dtype).to(module.weight.device)
+
+    # ── Embedding: rotate output (d_model) ──
+    embed = model.get_input_embeddings()
+    if embed is not None:
+        with torch.no_grad():
+            w_emb = embed.weight.data.float()  # (vocab, d_model)
+            d_model = w_emb.shape[1]
+            n = _next_power_of_2(d_model)
+            if n > d_model:
+                w_emb = torch.nn.functional.pad(w_emb, (0, n - d_model))
+            w_emb = apply_hadamard_rotation(w_emb, dim=1)[:, :d_model]
+            embed.weight.data = w_emb.to(embed.weight.dtype).to(embed.weight.device)
+
+    # ── LM head: rotate input (d_model) ──
+    lm_head = model.get_output_embeddings()
+    if lm_head is not None and lm_head is not embed:
+        with torch.no_grad():
+            w_head = lm_head.weight.data.float()
+            d_model = w_head.shape[1]
+            n = _next_power_of_2(d_model)
+            if n > d_model:
+                w_head = torch.nn.functional.pad(w_head, (0, n - d_model))
+            w_head = apply_hadamard_rotation(w_head, dim=1)[:, :d_model]
+            lm_head.weight.data = w_head.to(lm_head.weight.dtype).to(lm_head.weight.device)
 
 
 def apply_quantization_to_model(
@@ -301,12 +329,18 @@ def run_rot_quant_ppl_experiment(
     test_texts = test_texts[:num_ppl_samples]
     print(f"  Test: {len(test_texts)} WikiText-2 samples")
 
-    # ── Save original weights ──
+    # ── Save original weights (linear + embed + lm_head) ──
     linear_layers = get_linear_layers(model)
     original_weights = {
         name: module.weight.data.clone().cpu()
         for name, module in linear_layers
     }
+    embed = model.get_input_embeddings()
+    if embed is not None:
+        original_weights["__embed__"] = embed.weight.data.clone().cpu()
+    lm_head = model.get_output_embeddings()
+    if lm_head is not None and lm_head is not embed:
+        original_weights["__lm_head__"] = lm_head.weight.data.clone().cpu()
     print(f"  Saved {len(original_weights)} layer weights")
 
     results = {"model": str(model_path), "formats": {}}
@@ -388,11 +422,19 @@ def run_rot_quant_ppl_experiment(
 
 
 def restore_weights(model, saved_weights: Dict[str, torch.Tensor]):
-    """Restore model weights from saved copies."""
+    """Restore model weights from saved copies (linear + embed + lm_head)."""
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name in saved_weights:
             w = saved_weights[name].to(module.weight.device).to(module.weight.dtype)
             module.weight.data.copy_(w)
+    embed = model.get_input_embeddings()
+    if embed is not None and "__embed__" in saved_weights:
+        w = saved_weights["__embed__"].to(embed.weight.device).to(embed.weight.dtype)
+        embed.weight.data.copy_(w)
+    lm_head = model.get_output_embeddings()
+    if lm_head is not None and lm_head is not embed and "__lm_head__" in saved_weights:
+        w = saved_weights["__lm_head__"].to(lm_head.weight.device).to(lm_head.weight.dtype)
+        lm_head.weight.data.copy_(w)
 
 
 # ═════════════════════════════════════════════════════════════════════
