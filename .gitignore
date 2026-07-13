@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs
+results/
+outputs/
+*.pt
+*.bin
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude session logs
+.claude/logs/
