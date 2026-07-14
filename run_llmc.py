@@ -89,12 +89,12 @@ def recipe_nvfp4_no_rotation() -> list:
 
 
 def recipe_nvfp4_spinquant_r1r2() -> list:
-    """SpinQuant R1+R2 rotation (offline, zero inference overhead) + NVFP4."""
+    """SpinQuant R1+R2 rotation + NVFP4."""
     return [
         SpinQuantModifier(
             rotations=["R1", "R2"],
             transform_type="hadamard",
-            transform_block_size=128,  # block-wise: Qwen3 hidden_size=2560 not power-of-2
+            transform_block_size=128,
         ),
         QuantizationModifier(
             targets="Linear",
@@ -104,13 +104,13 @@ def recipe_nvfp4_spinquant_r1r2() -> list:
     ]
 
 
-def recipe_nvfp4_spinquant_full() -> list:
-    """SpinQuant R1+R2+R3+R4 (online rotations included) + NVFP4."""
+def recipe_nvfp4_spinquant_r1only() -> list:
+    """SpinQuant R1 only (no R2 — avoids head_dim issue with GQA) + NVFP4."""
     return [
         SpinQuantModifier(
-            rotations=["R1", "R2", "R3", "R4"],
+            rotations=["R1"],           # R1 only: hidden_dim rotation
             transform_type="hadamard",
-            transform_block_size=128,
+            transform_block_size=128,    # 128 divides hidden_size=2560 evenly
         ),
         QuantizationModifier(
             targets="Linear",
@@ -131,10 +131,10 @@ def recipe_int4_no_rotation() -> list:
     ]
 
 
-def recipe_int4_spinquant_r1r2() -> list:
-    """SpinQuant + INT4."""
+def recipe_int4_spinquant_r1only() -> list:
+    """SpinQuant R1 only + INT4."""
     return [
-        SpinQuantModifier(rotations=["R1", "R2"], transform_type="hadamard",
+        SpinQuantModifier(rotations=["R1"], transform_type="hadamard",
                           transform_block_size=128),
         QuantizationModifier(targets="Linear", scheme="W4A16", ignore=["lm_head"]),
     ]
@@ -190,10 +190,9 @@ def run_comparison(
     # ── 2-6. Quantized variants ──
     recipes = [
         ("NVFP4_noRot", recipe_nvfp4_no_rotation()),
-        ("NVFP4_SpinR1R2", recipe_nvfp4_spinquant_r1r2()),
-        ("NVFP4_SpinFull", recipe_nvfp4_spinquant_full()),
+        ("NVFP4_SpinR1", recipe_nvfp4_spinquant_r1only()),
         ("INT4_noRot", recipe_int4_no_rotation()),
-        ("INT4_SpinR1R2", recipe_int4_spinquant_r1r2()),
+        ("INT4_SpinR1", recipe_int4_spinquant_r1only()),
     ]
 
     for name, recipe in recipes:
@@ -268,24 +267,17 @@ def run_comparison(
 
     # Rotation benefit: NVFP4_noRot vs NVFP4_SpinR1R2
     no_rot = results["recipes"].get("NVFP4_noRot", {}).get("ppl")
-    sp_r1 = results["recipes"].get("NVFP4_SpinR1R2", {}).get("ppl")
-    sp_ful = results["recipes"].get("NVFP4_SpinFull", {}).get("ppl")
+    sp_r1 = results["recipes"].get("NVFP4_SpinR1", {}).get("ppl")
     if no_rot and sp_r1:
-        benefit_r1 = sp_r1 - no_rot
-        status = "✓ ROT HELPS" if benefit_r1 < 0 else "✗ ROT HURTS"
-        print(f"\n  NVFP4 SpinQuant R1+R2 benefit: ΔPPL = {benefit_r1:+.2f}  {status}")
-    if sp_r1 and sp_ful:
-        benefit_full = sp_ful - sp_r1
-        status = "✓ R3+R4 HELPS" if benefit_full < 0 else "✗ R3+R4 HURTS"
-        print(f"  R3+R4 additional benefit:     ΔPPL = {benefit_full:+.2f}  {status}")
-
-    # INT4 comparison
+        benefit = sp_r1 - no_rot
+        status = "✓ ROT HELPS" if benefit < 0 else "✗ ROT HURTS"
+        print(f"\n  NVFP4 SpinQuant R1 benefit:   ΔPPL = {benefit:+.2f}  {status}")
     int4_no = results["recipes"].get("INT4_noRot", {}).get("ppl")
-    int4_sp = results["recipes"].get("INT4_SpinR1R2", {}).get("ppl")
+    int4_sp = results["recipes"].get("INT4_SpinR1", {}).get("ppl")
     if int4_no and int4_sp:
         benefit_int4 = int4_sp - int4_no
         status = "✓ ROT HELPS" if benefit_int4 < 0 else "✗ ROT HURTS"
-        print(f"\n  INT4 SpinQuant R1+R2 benefit:  ΔPPL = {benefit_int4:+.2f}  {status}")
+        print(f"\n  INT4 SpinQuant R1 benefit:    ΔPPL = {benefit_int4:+.2f}  {status}")
 
     out_path = out_dir / "comparison.json"
     with open(out_path, "w") as f:
