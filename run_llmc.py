@@ -94,6 +94,7 @@ def recipe_nvfp4_spinquant_r1r2() -> list:
         SpinQuantModifier(
             rotations=["R1", "R2"],
             transform_type="hadamard",
+            transform_block_size=128,  # block-wise: Qwen3 hidden_size=2560 not power-of-2
         ),
         QuantizationModifier(
             targets="Linear",
@@ -109,6 +110,7 @@ def recipe_nvfp4_spinquant_full() -> list:
         SpinQuantModifier(
             rotations=["R1", "R2", "R3", "R4"],
             transform_type="hadamard",
+            transform_block_size=128,
         ),
         QuantizationModifier(
             targets="Linear",
@@ -132,7 +134,8 @@ def recipe_int4_no_rotation() -> list:
 def recipe_int4_spinquant_r1r2() -> list:
     """SpinQuant + INT4."""
     return [
-        SpinQuantModifier(rotations=["R1", "R2"], transform_type="hadamard"),
+        SpinQuantModifier(rotations=["R1", "R2"], transform_type="hadamard",
+                          transform_block_size=128),
         QuantizationModifier(targets="Linear", scheme="W4A16", ignore=["lm_head"]),
     ]
 
