@@ -37,9 +37,14 @@ def compute_wikitext_ppl(
     max_seq_len: int = 2048,
     device: str = "cuda",
 ) -> Dict:
-    """Compute WikiText-2 perplexity."""
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    texts = [t["text"] for t in ds if len(t["text"].strip()) > 50]
+    """Compute WikiText-2 perplexity. Falls back to PTB if unavailable."""
+    try:
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    except Exception:
+        print("    WikiText-2 unavailable, using PTB...")
+        ds = load_dataset("ptb_text_only", split="test")
+    texts = [t.get("text", t.get("sentence", "")) for t in ds
+             if len(t.get("text", t.get("sentence", "")).strip()) > 50]
     texts = texts[:max_samples]
 
     model = model.to(device).eval()
