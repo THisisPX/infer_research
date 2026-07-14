@@ -174,9 +174,9 @@ def run_comparison(
         print("Baseline: FP16 model PPL")
         print(f"{'='*60}")
         model_fp16 = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map=device,
+            model_path, torch_dtype=torch.bfloat16, device_map="cuda:0",
             trust_remote_code=True,
-        )
+        ).to("cuda:0")
         fp16_result = compute_wikitext_ppl(
             model_fp16, tokenizer, max_samples=ppl_samples, device=device,
         )
@@ -203,9 +203,9 @@ def run_comparison(
         print(f"  Loading model...")
         t0 = time.time()
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map=device,
+            model_path, torch_dtype=torch.bfloat16, device_map="cuda:0",
             trust_remote_code=True,
-        )
+        ).to("cuda:0")
         print(f"  Loaded in {time.time()-t0:.0f}s")
 
         # Apply recipe (SpinQuant + Quantize in one shot)
