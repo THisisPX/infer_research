@@ -1,12 +1,11 @@
 """SpinQuant rotation on/off + NVFP4 quantization PPL comparison via llm-compressor.
 
 Usage:
-    python run_llmc.py \
-      --model /workspace/volume/distributed-training-softdata/models/Qwen3-4B \
-      --output-dir results/llmc
-
-No manual rotation implementation needed — llm-compressor handles everything.
+    CUDA_VISIBLE_DEVICES=0 python run_llmc.py --model /path/to/Qwen3-4B
 """
+
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")  # must be before torch import
 
 import argparse
 import copy
