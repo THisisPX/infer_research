@@ -175,7 +175,7 @@ def run_vllm_eval(
             "prompt_tokens": prompt_lengths[i],
             "output_tokens": output_tokens,
             "total_tokens": prompt_lengths[i] + output_tokens,
-            "response": response[:500] + ("..." if len(response) > 500 else ""),
+            "response": response,  # save full response for qualitative analysis
         })
 
     accuracy = correct / total if total > 0 else 0
@@ -183,8 +183,10 @@ def run_vllm_eval(
     print(f"  Avg output tokens: {total_output_tokens/total:.0f}")
     print(f"  Total generation time: {gen_time:.0f}s")
 
-    # ── Bucket by output length ──
-    buckets = [(0, 512), (512, 1024), (1024, 2048), (2048, 4096), (4096, 8192), (8192, float('inf'))]
+    # ── Bucket by output length (fine granularity) ──
+    buckets = [(0, 1024), (1024, 2048), (2048, 3072), (3072, 4096),
+               (4096, 5120), (5120, 6144), (6144, 7168), (7168, 8192),
+               (8192, float('inf'))]
     bucket_stats = []
     for lo, hi in buckets:
         in_range = [r for r in results if lo <= r["output_tokens"] < hi]
@@ -245,7 +247,7 @@ def run_compare(results_dir: str = "results/aime_eval", plot: bool = False):
     print(f"\n  {'─'*80}")
     header = f"  {'Bucket':>18s}"
     for d in all_data:
-        header += f"  {d['label']:>20s}"
+        header += f"  {d['label']:>16s}"
     print(header)
     print(f"  {'─'*80}")
 
@@ -262,10 +264,65 @@ def run_compare(results_dir: str = "results/aime_eval", plot: bool = False):
             matches = [b for b in d.get("bucket_stats", []) if b["range"] == bucket_name]
             if matches:
                 b = matches[0]
-                row += f"  {b['accuracy']:.2%} (n={b['n']})".rjust(20)
+                row += f"  {b['accuracy']:.2%} (n={b['n']})".rjust(16)
             else:
-                row += " " * 20
+                row += " " * 16
         print(row)
+
+    # ── Per-problem correctness matrix ──
+    if len(all_data) == 2:
+        d0, d1 = all_data[0], all_data[1]
+        r0 = {r["idx"]: r for r in d0["results"]}
+        r1 = {r["idx"]: r for r in d1["results"]}
+        print(f"\n  {'─'*70}")
+        print(f"  Per-Problem Comparison: {d0['label']} vs {d1['label']}")
+        print(f"  {'─'*70}")
+        both_correct = both_wrong = only_0 = only_1 = 0
+        len_mismatch_problems = []
+        for idx in sorted(r0.keys()):
+            c0 = r0[idx]["correct"]
+            c1 = r1[idx]["correct"]
+            t0 = r0[idx]["output_tokens"]
+            t1 = r1[idx]["output_tokens"]
+            if c0 and c1:
+                both_correct += 1
+            elif not c0 and not c1:
+                both_wrong += 1
+            elif c0 and not c1:
+                only_0 += 1
+                len_mismatch_problems.append(f"      #{idx}: {d0['label']}=✓({t0} tok)  {d1['label']}=✗({t1} tok)")
+            else:
+                only_1 += 1
+                len_mismatch_problems.append(f"      #{idx}: {d0['label']}=✗({t0} tok)  {d1['label']}=✓({t1} tok)")
+        print(f"    Both correct: {both_correct}")
+        print(f"    Both wrong:   {both_wrong}")
+        print(f"    Only {d0['label']}: {only_0}")
+        print(f"    Only {d1['label']}: {only_1}")
+        if len_mismatch_problems:
+            print(f"\n    Disagreement cases:")
+            for p in len_mismatch_problems:
+                print(p)
+
+        # ── Length gap analysis ──
+        print(f"\n  {'─'*70}")
+        print(f"  Token Length Gap Analysis")
+        print(f"  {'─'*70}")
+        gaps = []
+        for idx in sorted(r0.keys()):
+            t0 = r0[idx]["output_tokens"]
+            t1 = r1[idx]["output_tokens"]
+            gaps.append((idx, t0, t1, r0[idx]["correct"], r1[idx]["correct"]))
+        avg_gap = np.mean([abs(t0-t1) for _, t0, t1, _, _ in gaps])
+        print(f"    Avg |length_diff|: {avg_gap:.0f} tokens")
+        print(f"    {d0['label']} avg out: {d0['avg_output_tokens']:.0f} tokens")
+        print(f"    {d1['label']} avg out: {d1['avg_output_tokens']:.0f} tokens")
+
+        # Per-problem output length comparison for disagreement cases
+        print(f"\n    Length comparison for disagreement cases:")
+        for idx, t0, t1, c0, c1 in gaps:
+            if c0 != c1:
+                winner = d0['label'] if c0 else d1['label']
+                print(f"      #{idx}: {d0['label']}={t0} tok  {d1['label']}={t1} tok  → {winner} wins")
 
     # Plot
     if plot:
