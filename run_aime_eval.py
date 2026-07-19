@@ -162,6 +162,7 @@ def run_vllm_eval(
         pred = extract_answer(response)
         label_val = int(problem["label"].strip())
         is_correct = (pred == label_val)
+        is_truncated = output_tokens >= max_tokens - 10  # hit max_tokens cap
 
         if is_correct:
             correct += 1
@@ -172,6 +173,7 @@ def run_vllm_eval(
             "label": problem["label"],
             "prediction": pred,
             "correct": is_correct,
+            "is_truncated": is_truncated,
             "prompt_tokens": prompt_lengths[i],
             "output_tokens": output_tokens,
             "total_tokens": prompt_lengths[i] + output_tokens,
@@ -179,7 +181,13 @@ def run_vllm_eval(
         })
 
     accuracy = correct / total if total > 0 else 0
+    n_truncated = sum(1 for r in results if r["is_truncated"])
+    trunc_correct = sum(1 for r in results if r["is_truncated"] and r["correct"])
     print(f"\n  Accuracy: {correct}/{total} = {accuracy:.2%}")
+    print(f"  Truncated (hit max_tokens): {n_truncated}/{total} "
+          f"({n_truncated/total:.0%}) — {trunc_correct} of these correct")
+    print(f"  Non-truncated accuracy: {correct - trunc_correct}/{total - n_truncated}"
+          + (f" = {(correct - trunc_correct)/(total - n_truncated):.2%}" if total > n_truncated else ""))
     print(f"  Avg output tokens: {total_output_tokens/total:.0f}")
     print(f"  Total generation time: {gen_time:.0f}s")
 
@@ -235,9 +243,11 @@ def run_compare(results_dir: str = "results/aime_eval", plot: bool = False):
             data = json.load(f)
         all_data.append(data)
         label = data.get("label", path.stem)
+        n_trunc = sum(1 for r in data.get("results", []) if r.get("is_truncated", False))
         print(f"  {label:<10s}  Acc: {data['accuracy']:.2%}  "
               f"({data['correct']}/{data['total']})  "
-              f"Avg out: {data['avg_output_tokens']:.0f} tok")
+              f"Avg out: {data['avg_output_tokens']:.0f} tok  "
+              f"Truncated: {n_trunc}/{data['total']}")
 
     if not all_data:
         print("  No results found")
@@ -368,7 +378,7 @@ def main():
     parser.add_argument("--model", type=str, help="Model path")
     parser.add_argument("--label", type=str, default="", help="Label for this run")
     parser.add_argument("--data", type=str, default="/workspace/volume/pengxiong/datasets/aime-2024/aime-2024.jsonl")
-    parser.add_argument("--max-tokens", type=int, default=8192)
+    parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--tensor-parallel", type=int, default=1)
     parser.add_argument("--compare", type=str, help="Compare results directory")
     parser.add_argument("--plot", action="store_true")
